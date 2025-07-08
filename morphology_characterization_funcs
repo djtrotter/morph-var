@@ -1,0 +1,130 @@
+# pip install LFPy
+
+import numpy as np 
+import matplotlib.pyplot as plt
+import pandas as pd 
+import math
+import json
+import os
+import LFPy
+from mpl_toolkits import mplot3d
+
+#from neuron_morphology.morphology import Morphology
+SWC_COLUMNS = ('id', 'type', 'x', 'y', 'z', 'radius', 'parent',)
+COLUMN_CASTS = {
+    'id': int,
+    'parent': int,
+    'type': int
+} 
+
+def read_swc(path, columns=SWC_COLUMNS, sep=' ', casts=COLUMN_CASTS):
+    """ 
+    Read an swc file into a pandas dataframe 
+    """
+    df = pd.read_csv(path, names=columns, comment='#', sep=sep)
+    apply_casts(df, casts)
+    return df
+
+def apply_casts(df, casts):
+    for key, typ in casts.items():
+        df[key] = df[key].astype(typ)
+
+## Find the soma position 
+def _somapos(file):
+    pos = []
+    for i in range(len(file['type'])):
+        if file['type'][i] == 1:
+            pos.append((file['x'][i],file['y'][i],file['z'][i]))
+    return pos
+
+## re-calculate all the {x,y,z} coordinates relative to its position
+def relative_coords(file,somapos):
+    coords = np.zeros((3,len(file['type'])))
+    for j in range(coords.shape[1]):
+        coords[:,j] = file['x'][j]-somapos[0],file['y'][j]-somapos[1],file['z'][j]-somapos[2]
+    return coords
+
+def rotate_cell(coords,Rot):
+    return np.dot(coords.T,Rot)
+
+def density_counter(coords):
+    q1, q2, q3, q4, q5, q6, q7, q8 = 0,0,0,0,0,0,0,0
+    ## coords are {x,y,z} where b/c the allen institute x is vertical axis
+    rho1,rho2,rho3,rho4,rho5,rho6,rho7,rho8 = [],[],[],[],[],[],[],[]
+    for i in range(coords.shape[1]):
+        if coords[0,i] >= 0 and coords[1,i] >= 0 and coords[2,i] >= 0:
+            q1 +=1
+            rho1.append((coords[0,i],coords[1,i],coords[2,i]))
+        elif coords[0,i] < 0 and coords[1,i] >= 0 and coords[2,i] >= 0:
+            q2 +=1
+            rho2.append((coords[0,i],coords[1,i],coords[2,i]))
+        elif coords[0,i] < 0 and coords[1,i] < 0 and coords[2,i] >= 0:
+            q3 +=1 
+            rho3.append((coords[0,i],coords[1,i],coords[2,i]))
+        elif coords[0,i] >= 0 and coords[1,i] < 0 and coords[2,i] >= 0:
+            q4 += 1
+            rho4.append((coords[0,i],coords[1,i],coords[2,i]))
+        elif coords[0,i] >= 0 and coords[1,i] >= 0 and coords[2,i] < 0:
+            q5 +=1
+            rho5.append((coords[0,i],coords[1,i],coords[2,i]))
+        elif coords[0,i] < 0 and coords[1,i] >= 0 and coords[2,i] < 0:
+            q6 +=1
+            rho6.append((coords[0,i],coords[1,i],coords[2,i]))
+        elif coords[0,i] < 0 and coords[1,i] < 0 and coords[2,i] < 0:
+            q7 +=1 
+            rho7.append((coords[0,i],coords[1,i],coords[2,i]))
+        elif coords[0,i] >= 0 and coords[1,i] < 0 and coords[2,i] < 0:
+            q8 += 1
+            rho8.append((coords[0,i],coords[1,i],coords[2,i]))
+    R = [rho1,rho2,rho3,rho4,rho5,rho6,rho7,rho8]
+    return q1,q2,q3,q4,q5,q6,q7,q8,R
+
+def volume_find(i, R1):
+    ## Find the farthest radial point from origin of each cell in all 8 quadrants
+    _R1 = np.zeros(len(R1[i]))
+    for j in range(len(R1[i])):
+        _R1[j] = math.sqrt(R1[i][j][0]**2+R1[i][j][1]**2+R1[i][j][2]**2)
+    return R1[i][np.argmax(_R1)]
+
+def load_pickle(filename):
+    with open(filename, "rb") as file:
+        return pickle.load(file)
+
+def Rg(dic): 
+  '''
+  dic == directory where model file is stored
+  '''
+    os.chdir(dic)
+    print(os.getcwd())
+    with open('fit_parameters.json') as f:
+        data = json.load(f)
+    cell_params = {
+    'morphology' : 'reconstruction.swc',
+    'v_init' : data['conditions'][0]['v_init'],
+    'tstart' : -50,
+    'tstop' : 3000,
+    'passive': True
+    }
+    cell = LFPy.Cell(**cell_params) #, delete_sections=True)
+    cell.set_pos(x=0, y=0, z=0)
+    cell.set_rotation(z=np.pi/2)
+    
+    val = np.zeros(5)
+    ## maximum x-length, maximum z-length, maximum y-length, postive x length (soma = 0), negative x length 
+    val = (abs(cell.x.min()-cell.x.max()),abs(cell.z.min()-cell.z.max()),abs(cell.y.min()-cell.y.max()),abs(0-cell.x.max()),abs(0-cell.x.min()))
+    
+    ## compartment lengths (cl) and diameters (cd) for the axonal (_a), dendritic (_d) and somatic (_s) compartments
+    cl_a,cd_a = [],[]
+    cl_d,cd_d = [],[]
+    cl_s,cd_s = [],[]
+    for sec in cell.allseclist:
+        if sec.name()[:4] == "axon":
+            cl_a.append(sec.L)  
+            cd_a.append(sec.diam)
+        elif sec.name()[:4] == "soma":
+            cl_s.append(sec.L)
+            cd_s.append(sec.diam)
+        elif sec.name()[:4] == "dend" or sec.name()[:4] == "apic":
+            cl_d.append(sec.L)
+            cd_d.append(sec.diam)
+    return val, cl_a, cd_a, cl_d, cd_d, cl_s, cd_s
