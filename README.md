@@ -1,6 +1,7 @@
 # morph-var
 
-Eventual repository for which the code simulating uniform E-field stimulation of Allen Institute(1) biophysical neuron models will be uploaded. 
+Code repository for functions written in the analysis of: https://doi.org/10.1101/2023.06.30.547168 
+
+The neuron models used for the work can be downloaded online (via the allensdk package) or offline from: https://celltypes.brain-map.org/data
 
 
-1 - Allen models at https://github.com/AllenInstitute/AllenSDK/tree/master/allensdk/model/biophysical
