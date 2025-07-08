@@ -1,0 +1,323 @@
+## pip install pingouin
+## pip install umap-learn
+import numpy as np
+import matplotlib.pyplot as plt
+import math, json, os, logging
+from allensdk.model.biophys_sim.config import Config
+from neuron import h
+import sklearn
+from sklearn import linear_model
+import matplotlib.pyplot as plt
+import pandas as pd
+from scipy import stats
+import pickle
+import pingouin as pg
+from pkg_resources import resource_filename
+import seaborn as sns
+from sklearn.preprocessing import StandardScaler
+
+## Array of soma positions to generate relative positions of all other branches to soma
+def rotate_cell(somapos,Rot,sec,i):
+    rel_pos = np.transpose(np.array([sec.x3d(i)-somapos[0],
+                                    sec.y3d(i)-somapos[1],
+                                    sec.z3d(i)-somapos[2]]))
+    return np.dot(rel_pos,Rot)
+
+## Susceptibility 
+def Susceptibility(allmu):
+  slopes = np.zeros(np.shape(allmu)[0])
+  for i in range(np.shape(allmu)[0]):
+    slopes[i] = (allmu[i,-1]-allmu[i,0])/100
+  return slopes
+
+
+## class functions from allensdk database 
+class HocUtils(object):
+    '''A helper class for containing references to NEUORN.
+    Attributes
+    ----------
+    h : object
+        The NEURON hoc object.
+    nrn : object
+        The NEURON python object.
+    neuron : module
+        The NEURON module.
+    '''
+    _log = logging.getLogger(__name__)
+    h = None
+    nrn = None
+    neuron = None
+
+    def __init__(self, description):
+        import neuron
+        import nrn
+
+        self.h = neuron.h
+        HocUtils.neuron = neuron
+        HocUtils.nrn = nrn
+        HocUtils.h = self.h
+
+        self.description = description
+        self.manifest = description.manifest
+
+        self.hoc_files = description.data['neuron'][0]['hoc']
+
+        self.initialize_hoc()
+
+    def initialize_hoc(self):
+        '''Basic setup for NEURON.'''
+        h = self.h
+        params = self.description.data['conditions'][0]
+
+        for hoc_file in self.hoc_files:
+            HocUtils._log.info("loading hoc file %s" % (hoc_file))
+            HocUtils.h.load_file(str(hoc_file))
+
+        h('starttime = startsw()')
+
+        if 'celsius' in params:
+            h.celsius = params['celsius']
+
+        if 'v_init' in params:
+            h.v_init = params['v_init']
+
+        if 'dt' in params:
+            h.dt = params['dt']
+            h.steps_per_ms = 1.0 / h.dt
+
+        if 'tstop' in params:
+            h.tstop = params['tstop']
+            h.runStopAt = h.tstop
+
+class _AllActive(HocUtils): ## HocUtils important so that it knows about neuron/h
+
+    def __init__(self):
+        """
+        Parameters: NA at the moment
+        """
+        self.update_default_cell_hoc(description)
+        super(_AllActive, self).__init__(description)
+        #self.axon_type = axon_type
+
+    def update_default_cell_hoc(self, description, default_cell_hoc='cell.hoc'):
+        ''' replace the default 'cell.hoc' path in the manifest with 'cell.hoc' packaged
+        within AllenSDK if it does not exist '''
+
+        hoc_files = description.data['neuron'][0]['hoc']
+        try:
+            hfi = hoc_files.index(default_cell_hoc)
+
+            if not os.path.exists(default_cell_hoc):
+                abspath_ch = resource_filename(__name__,
+                                               default_cell_hoc)
+                hoc_files[hfi] = abspath_ch
+
+                if not os.path.exists(abspath_ch):
+                    raise IOError("cell.hoc does not exist!")
+
+                self._log.warning("Using cell.hoc from the following location: %s", abspath_ch)
+        except ValueError as e:
+            pass
+
+    def generate_morphology(self, morph_filename):
+        '''Load a neurolucida or swc-format cell morphology file.
+        Parameters
+        ----------
+        morph_filename : string
+            Path to morphology.
+        '''
+        #self._log.info('Legacy model - Truncating reconstructed axon after 60 micron')
+        morph_basename = os.path.basename(morph_filename)
+        morph_extension = morph_basename.split('.')[-1]
+        if morph_extension.lower() == 'swc':
+            morph = self.h.Import3d_SWC_read()
+        elif morph_extension.lower() == 'asc':
+            morph = self.h.Import3d_Neurolucida3()
+        else:
+            raise Exception("Unknown filetype: %s" % morph_extension)
+
+        morph.input(morph_filename)
+        imprt = self.h.Import3d_GUI(morph, 0)
+
+        self.h("objref this")
+        imprt.instantiate(self.h.this)
+
+        for sec in self.h.allsec():
+            sec.nseg = 1 + 2 * int(sec.L / 40.0)
+
+        self.h("soma[0] area(0.5)")
+        axon_diams = [self.h.axon[0].diam, self.h.axon[0].diam]
+        self.h.distance(sec=self.h.soma[0])
+        #count = 0
+        for sec in self.h.allsec():
+            if sec.name()[:4] == "axon":
+                #count += 1
+                sec.nseg = 10 ## control the number of nseg (pts at which cable eq'n integrated) in axon compartment
+                if self.h.distance(0.5, sec=sec) > 60:
+                    axon_diams[1] = sec.diam
+                    break
+        #print(count)
+        for index, sec in enumerate(self.h.axon):
+            print("ind:",index)
+        # make sure diam reflects 3d points
+        self.h.area(.5, sec=self.h.soma[0])
+
+    def load_cell_parameters(self):
+        '''Configure a neuron after the cell morphology has been loaded.'''
+        passive = self.description.data['passive'][0]
+        genome = self.description.data['genome']
+        conditions = self.description.data['conditions'][0]
+        h = self.h
+
+        h("access soma")
+
+        # Set fixed passive properties
+        for sec in h.allsec():
+            sec.Ra = passive['ra']
+            sec.insert('pas')
+            # for seg in sec:
+            #     seg.pas.e = passive["e_pas"]
+
+        # Insert channels and set parameters
+        for p in genome:
+            section_array = p["section"]
+            mechanism = p["mechanism"]
+            param_name = p["name"]
+            param_value = float(p["value"])
+            if section_array == "glob":  # global parameter
+                h(p["name"] + " = %g " % p["value"])
+            else:
+                if hasattr(h, section_array):
+                    if mechanism != "":
+                        print('Adding mechanism %s to %s'
+                              % (mechanism, section_array))
+                        for section in getattr(h, section_array):
+                            if self.h.ismembrane(str(mechanism),
+                                                 sec=section) != 1:
+                                section.insert(mechanism)
+
+                    print('Setting %s to %.6g in %s'
+                          % (param_name, param_value, section_array))
+                    for section in getattr(h, section_array):
+                        setattr(section, param_name, param_value)
+
+        # Set reversal potentials
+        for erev in conditions['erev']:
+            erev_section_array = erev["section"]
+            ek = float(erev["ek"])
+            ena = float(erev["ena"])
+
+            print('Setting ek to %.6g and ena to %.6g in %s'
+                  % (ek, ena, erev_section_array))
+
+            if hasattr(h, erev_section_array):
+                for section in getattr(h, erev_section_array):
+                    if self.h.ismembrane("k_ion", sec=section) == 1:
+                        setattr(section, 'ek', ek)
+
+                    if self.h.ismembrane("na_ion", sec=section) == 1:
+                        setattr(section, 'ena', ena)
+            else:
+                print("Warning: can't set erev for %s, "
+                      "section array doesn't exist" % erev_section_array)
+
+        self.h.v_init = conditions['v_init']
+        self.h.celsius = conditions['celsius']
+
+        for sec in self.h.allsec():
+            if sec.name()[:4] == "axon":
+                for seg in sec:
+                    for mech in seg: # iterates over the segment mechanisms
+                        print('%s %g %s' % (sec, seg.x, mech.name()))
+        i = 0
+        for sec in self.h.allsec():
+            if sec.name()[:4] == "axon":
+                for seg in sec.allseg():
+                    ## probability of an axon segment being myelinated
+                    probability = np.random.binomial(1,.15)
+                    if probability == 1 and i != 0 and i < (sec.nseg+1): ## i={0,nseg+1} are comp'nt ends have no mech's
+                        seg.Kd.gbar = 0
+                        seg.K_T.gbar = 0
+                        seg.Ca_HVA.gbar = 0
+                        seg.Ca_LVA.gbar = 0
+                        seg.SK.gbar = 0
+                        seg.Kv3_1.gbar = 0
+                        seg.Kv2like.gbar = 0
+                        seg.NaV.gbar = 0
+                    i+=1
+                    #print("seg:",seg)
+
+def angs(test):
+  ## make a list of angles between compartment and vertical axis
+  angslist = []
+  angslist.append(1)
+  for sec in test.h.allsec():
+    for i in range(sec.nseg):
+      if sec.name()[:4] != 'soma':
+        angslist.append(np.arccos(sec.x3d(i)/np.sqrt(sec.x3d(i)**2+sec.y3d(i)**2+sec.z3d(i)**2)))
+  return angslist
+
+def Efield(E1,m,s,angslist):
+    Et = np.zeros(len(angslist))
+    Et[0] = E1 + np.random.normal(m,s)
+    for i in range(1,len(angslist)):
+        if E1 != 0:
+            Et[i] = E1*np.cos(angslist[i]) + np.random.normal(m,s)
+    return Et
+
+def calc_partialcorr(dt,xvar,yvar,covars,method=='spearman'): 
+  '''
+  dt == Dataframe of morphology fts + suscept
+  xvar, yvar -> strings (col labs)
+  covar = list of col labs
+  '''
+  return pg.partial_corr(dt3,x='DendDiam',y='Slopes',covar=['DendLen'],method=method)
+
+## umap creation
+
+dt = {
+    'Volume':vols_ell,
+    'Length':lens_all,
+    'Vector Mag':vecmag_all,
+    'DendLen':dend_clen,
+    'DendDiam':dend_cdiam,
+    'DendBran':dend_cbranch,
+    'AxLen':ax_clen,
+    'AxDiam':ax_cdiam,
+    'AxBran':ax_cbranch,
+    'Slopes':slopes,
+    'Labels':labels}
+
+dt3 = pd.DataFrame(data=dt)
+
+df_data = dt3[
+    [
+        "Volume",
+        "Length",
+        "Vector Mag",
+        "DendLen",
+        "DendDiam",
+        "DendBran",
+        "AxLen",
+        "AxDiam",
+        "AxBran",
+        "Slopes"
+    ]
+].values
+scaled_df_data = StandardScaler().fit_transform(df_data)
+
+reducer = umap.UMAP()#n_neighbors=i)
+embedding = reducer.fit_transform(scaled_df_data)
+
+def plotumap(embedding):
+  #plt.figure(figsize=(6,6))
+  fig,ax = plt.subplots(figsize=(6,6))
+  ax.scatter(embedding[:, 0],embedding[:, 1],s = 50,c=[sns.mpl_palette("tab20",12)[x] for x in dt3.Labels.map({"PC L5":0, "PV L5":2, "PC L4":4, "PV L4":6, "PC L23":8, "PV L23":10})])
+  for place in ['top','right','left','bottom']:
+    ax.spines[place].set_visible(False)
+  ax.set_xlabel("UMAP 1",fontsize=15)
+  ax.set_ylabel("UMAP 2",fontsize=15)
+  ax.set_xticks([])
+  ax.set_yticks([])
+  #plt.savefig("AllFactors_UMAP.svg",format='svg')
+  plt.show()
